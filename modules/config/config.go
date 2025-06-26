@@ -16,6 +16,15 @@ type Config struct {
 }
 
 func NewConfig(port int, host string, securityKey crypto.SecurityKey, staticDir string) *Config {
+	if port == 0 {
+		port = PORT
+	}
+	if host == "" {
+		host = HOST
+	}
+	if staticDir == "" {
+		staticDir = STATIC_DIR_PATH
+	}
 
 	return &Config{
 		Port:        port,
@@ -30,11 +39,8 @@ func DefaultConfig(passphrase string) *Config {
 	path := getPath()
 
 	if hasKeys(path) {
-		priv, pub, err := crypto.LoadSecurityKey(filepath.Join(path, "keys.key"), []byte(passphrase))
-		if err != nil {
-			log.Fatalf("failed to load security key: %v", err)
-		}
-		securityKey = crypto.SecurityKey{PrivKey: priv, PubKey: pub}
+		
+		securityKey = loadSecurityKey(path, passphrase)
 	} else {
 		sk, err := crypto.NewSecurityKey()
 		if err != nil {
@@ -48,6 +54,14 @@ func DefaultConfig(passphrase string) *Config {
 	}
 
 	return NewConfig(PORT, HOST, securityKey, STATIC_DIR_PATH)
+}
+
+func loadSecurityKey(path string, passphrase string) crypto.SecurityKey {
+	priv, pub, err := crypto.LoadSecurityKey(filepath.Join(path, "keys.key"), []byte(passphrase))
+	if err != nil {
+		log.Fatalf("failed to load security key: %v", err)
+	}
+	return crypto.SecurityKey{PrivKey: priv, PubKey: pub}
 }
 
 func hasKeys(path string) bool {
@@ -73,5 +87,3 @@ func getDir(dir string, subdir string) string {
 
 	return subDirPath
 }
-
-
