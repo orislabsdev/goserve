@@ -9,6 +9,7 @@ import (
 
 func Run() {
 	var (
+		mode       = flag.String("mode", "prod", "Modo del servidor: dev o prod")
 		port       = flag.String("port", "", "Puerto HTTPS (opcional)")
 		host       = flag.String("host", "", "Dominio o IP principal")
 		staticDir  = flag.String("dir", "", "Ruta a los archivos estáticos")
@@ -34,5 +35,5 @@ func Run() {
 		cfg.BackendURL = *backendURL
 	}
 
-	server.Start(cfg)
+	server.Start(cfg, *mode)
 }

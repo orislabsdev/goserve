@@ -2,7 +2,6 @@ package server
 
 import (
 	"compress/gzip"
-	"crypto/tls"
 	"io"
 	"log"
 	"net/http"
@@ -13,23 +12,13 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/crypto/acme/autocert"
+
 	"github.com/polarysfoundation/go-server/modules/config"
 )
 
-func Start(cfg *config.Config) {
+func Start(cfg *config.Config, mode string) {
 	apiProxy := proxyAPIHandler(cfg.BackendURL)
-
-	// Redirección HTTP a HTTPS
-	go func() {
-		log.Printf("[HTTP] Redireccionando tráfico a HTTPS desde puerto 80")
-		err := http.ListenAndServe(":80", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			target := "https://" + cfg.Host + r.RequestURI
-			http.Redirect(w, r, target, http.StatusMovedPermanently)
-		}))
-		if err != nil {
-			log.Fatalf("Error al redirigir HTTP: %v", err)
-		}
-	}()
 
 	mux := http.NewServeMux()
 	handler := corsMiddleware(cfg.Host,
@@ -41,23 +30,52 @@ func Start(cfg *config.Config) {
 	)
 	mux.Handle("/", handler)
 
-	server := &http.Server{
-		Addr:    ":" + cfg.Port,
-		Handler: mux,
-		TLSConfig: &tls.Config{
-			MinVersion:               tls.VersionTLS12,
-			PreferServerCipherSuites: true,
-		},
+	if mode == "dev" {
+		// 🔓 MODO DESARROLLO: solo HTTP
+		addr := cfg.Port
+		if cfg.Host != "" {
+			addr = cfg.Host + ":" + cfg.Port
+		} // o configurable desde cfg.Port si quieres
+		log.Printf("[DEV] Servidor HTTP iniciado en http://localhost%s", addr)
+		server := &http.Server{
+			Addr:    addr,
+			Handler: mux,
+		}
+		if err := server.ListenAndServe(); err != nil {
+			log.Fatalf("Error en servidor dev HTTP: %v", err)
+		}
+		return
 	}
 
-	certFile := filepath.Join(config.CERT_PATH, "fullchain.pem")
-	keyFile := filepath.Join(config.CERT_PATH, "privkey.pem")
+	// 🔐 MODO PRODUCCIÓN: HTTPS con autocert + redirección desde HTTP
+	certManager := autocert.Manager{
+		Cache:      autocert.DirCache(".certs"),
+		Prompt:     autocert.AcceptTOS,
+		HostPolicy: autocert.HostWhitelist(cfg.Host),
+	}
 
-	log.Printf("[HTTPS] Servidor iniciado en https://%s:%s", cfg.Host, cfg.Port)
-	if err := server.ListenAndServeTLS(certFile, keyFile); err != nil {
-		log.Fatalf("Error en servidor HTTPS: %v", err)
+	// Redirección HTTP a HTTPS + ACME
+	go func() {
+		log.Printf("[HTTP] Sirviendo challenge ACME y redirigiendo HTTP -> HTTPS en :80")
+		err := http.ListenAndServe(":80", certManager.HTTPHandler(nil))
+		if err != nil {
+			log.Fatalf("Error en servidor HTTP para autocert: %v", err)
+		}
+	}()
+
+	server := &http.Server{
+		Addr:      ":443",
+		Handler:   mux,
+		TLSConfig: certManager.TLSConfig(),
+	}
+
+	log.Printf("[HTTPS] Servidor seguro iniciado en https://%s", cfg.Host)
+	if err := server.ListenAndServeTLS("", ""); err != nil {
+		log.Fatalf("Error en servidor HTTPS con autocert: %v", err)
 	}
 }
+
+// === Handlers y middleware igual que antes ===
 
 func proxyAPIHandler(backendURL string) http.Handler {
 	target, err := url.Parse(backendURL)
