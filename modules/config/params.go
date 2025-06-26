@@ -4,5 +4,6 @@ var (
 	PORT            = 8080
 	HOST            = "0.0.0.0"
 	STATIC_DIR_PATH = "./static"
-	KEY_DIR         = "./keys"
+	KEY_DIR         = ".keys"
+	BASE_PATH = ".go-server"
 )

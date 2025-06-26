@@ -1,6 +1,12 @@
 package config
 
-import "github.com/polarysfoundation/go-server/modules/crypto"
+import (
+	"log"
+	"os"
+	"path/filepath"
+
+	"github.com/polarysfoundation/go-server/modules/crypto"
+)
 
 type Config struct {
 	Port        int
@@ -27,8 +33,21 @@ func DefaultConfig() *Config {
 	return NewConfig(PORT, HOST, securityKey, STATIC_DIR_PATH)
 }
 
-
-func LoadSecurityKey(path string) (crypto.SecurityKey, error) {
-	
+func getPath() string {
+	return filepath.Join(getDir(BASE_PATH, KEY_DIR))
 }
 
+func getDir(dir string, subdir string) string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatalf("failed to get home directory: %v", err)
+	}
+	subDirPath := filepath.Join(homeDir, dir, subdir)
+
+	err = os.MkdirAll(subDirPath, os.ModePerm)
+	if err != nil {
+		log.Fatalf("failed to create %s directory: %v", subdir, err)
+	}
+
+	return subDirPath
+}
