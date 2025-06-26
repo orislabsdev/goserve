@@ -4,6 +4,7 @@ import (
 	"flag"
 
 	"github.com/polarysfoundation/go-server/modules/config"
+	"github.com/polarysfoundation/go-server/modules/server"
 )
 
 func Run() {
@@ -33,6 +34,5 @@ func Run() {
 		cfg.BackendURL = *backendURL
 	}
 
-	
-
+	server.Start(cfg)
 }

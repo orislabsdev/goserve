@@ -16,7 +16,7 @@ import (
 	"github.com/polarysfoundation/go-server/modules/config"
 )
 
-func startServer(cfg *config.Config) {
+func Start(cfg *config.Config) {
 	apiProxy := proxyAPIHandler(cfg.BackendURL)
 
 	// Redirección HTTP a HTTPS
