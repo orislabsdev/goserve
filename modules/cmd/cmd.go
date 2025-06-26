@@ -1,1 +1,38 @@
 package cmd
+
+import (
+	"flag"
+
+	"github.com/polarysfoundation/go-server/modules/config"
+)
+
+func Run() {
+	var (
+		port       = flag.String("port", "", "Puerto HTTPS (opcional)")
+		host       = flag.String("host", "", "Dominio o IP principal")
+		staticDir  = flag.String("dir", "", "Ruta a los archivos estáticos")
+		backendURL = flag.String("backend", "", "URL del backend")
+		passphrase = flag.String("key-pass", "changeme", "Frase secreta para desencriptar/generar claves")
+	)
+
+	flag.Parse()
+
+	cfg := config.DefaultConfig(*passphrase)
+
+	// Si los flags fueron provistos, actualizan los valores por defecto
+	if *port != "" {
+		cfg.Port = *port
+	}
+	if *host != "" {
+		cfg.Host = *host
+	}
+	if *staticDir != "" {
+		cfg.StaticDir = *staticDir
+	}
+	if *backendURL != "" {
+		cfg.BackendURL = *backendURL
+	}
+
+	
+
+}

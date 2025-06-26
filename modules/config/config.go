@@ -9,14 +9,15 @@ import (
 )
 
 type Config struct {
-	Port        int
+	Port        string
 	Host        string
 	SecurityKey crypto.SecurityKey
 	StaticDir   string
+	BackendURL  string
 }
 
-func NewConfig(port int, host string, securityKey crypto.SecurityKey, staticDir string) *Config {
-	if port == 0 {
+func NewConfig(port string, host string, securityKey crypto.SecurityKey, staticDir string, backend string) *Config {
+	if port == "" {
 		port = PORT
 	}
 	if host == "" {
@@ -26,11 +27,16 @@ func NewConfig(port int, host string, securityKey crypto.SecurityKey, staticDir 
 		staticDir = STATIC_DIR_PATH
 	}
 
+	if backend == "" {
+		backend = BACKEND_URL
+	}
+
 	return &Config{
 		Port:        port,
 		Host:        host,
 		SecurityKey: securityKey,
 		StaticDir:   staticDir,
+		BackendURL:  backend,
 	}
 }
 
@@ -39,7 +45,7 @@ func DefaultConfig(passphrase string) *Config {
 	path := getPath()
 
 	if hasKeys(path) {
-		
+
 		securityKey = loadSecurityKey(path, passphrase)
 	} else {
 		sk, err := crypto.NewSecurityKey()
@@ -53,7 +59,7 @@ func DefaultConfig(passphrase string) *Config {
 		securityKey = sk
 	}
 
-	return NewConfig(PORT, HOST, securityKey, STATIC_DIR_PATH)
+	return NewConfig(PORT, HOST, securityKey, STATIC_DIR_PATH, BACKEND_URL)
 }
 
 func loadSecurityKey(path string, passphrase string) crypto.SecurityKey {
