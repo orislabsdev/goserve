@@ -20,15 +20,21 @@ import (
 func Start(cfg *config.Config, mode string) {
 	apiProxy := proxyAPIHandler(cfg.BackendURL)
 
-	mux := http.NewServeMux()
-	handler := corsMiddleware(cfg.Host,
+	apiHandler := corsMiddleware(cfg.Host,
+		loggingMiddleware(apiProxy),
+	)
+
+	staticHandler := corsMiddleware(cfg.Host,
 		gzipMiddleware(
 			loggingMiddleware(
 				http.HandlerFunc(staticHandler(cfg.StaticDir, apiProxy)),
 			),
 		),
 	)
-	mux.Handle("/", handler)
+
+	mux := http.NewServeMux()
+	mux.Handle("/api/", apiHandler)
+	mux.Handle("/", staticHandler)
 
 	if mode == "dev" {
 		// 🔓 MODO DESARROLLO: solo HTTP
@@ -99,25 +105,42 @@ func staticHandler(staticDir string, apiProxy http.Handler) http.HandlerFunc {
 			apiProxy.ServeHTTP(w, r)
 			return
 		}
+
 		path := filepath.Join(staticDir, r.URL.Path)
+
+		// Si el archivo existe, lo sirve directamente
 		if info, err := os.Stat(path); err == nil && !info.IsDir() {
 			fs.ServeHTTP(w, r)
 			return
 		}
+
+		// Si la ruta tiene extensión (ej. .js), no sirve index.html: responde 404
+		if strings.Contains(filepath.Base(r.URL.Path), ".") {
+			http.NotFound(w, r)
+			return
+		}
+
+		// Rutas tipo /dashboard, /home → sirve index.html
 		http.ServeFile(w, r, filepath.Join(staticDir, "index.html"))
 	}
 }
 
 func corsMiddleware(domain string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "https://"+domain)
+		origin := r.Header.Get("Origin")
+		if origin != "" && (strings.Contains(origin, domain) || strings.Contains(origin, "localhost")) {
+			w.Header().Set("Access-Control-Allow-Origin", origin) // ← usa el origin dinámicamente
+		}
+
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+
 		next.ServeHTTP(w, r)
 	})
 }
