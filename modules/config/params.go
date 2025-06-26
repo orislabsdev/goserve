@@ -5,5 +5,5 @@ var (
 	HOST            = "0.0.0.0"
 	STATIC_DIR_PATH = "./static"
 	KEY_DIR         = ".keys"
-	BASE_PATH = ".go-server"
+	BASE_PATH       = ".go-server"
 )
