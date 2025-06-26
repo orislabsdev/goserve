@@ -17,6 +17,5 @@ func NewSecurityKey() (SecurityKey, error) {
 		PubKey:  pub,
 		PrivKey: priv,
 	}, nil
-
 }
 
