@@ -21,13 +21,17 @@ func Start(cfg *config.Config, mode string) {
 	apiProxy := proxyAPIHandler(cfg.BackendURL)
 
 	apiHandler := corsMiddleware(cfg.Host,
-		loggingMiddleware(apiProxy),
+		securityHeadersMiddleware(
+			loggingMiddleware(apiProxy),
+		),
 	)
 
 	staticHandler := corsMiddleware(cfg.Host,
-		gzipMiddleware(
-			loggingMiddleware(
-				http.HandlerFunc(staticHandler(cfg.StaticDir, apiProxy)),
+		securityHeadersMiddleware(
+			gzipMiddleware(
+				loggingMiddleware(
+					http.HandlerFunc(staticHandler(cfg.StaticDir, apiProxy)),
+				),
 			),
 		),
 	)
@@ -39,10 +43,10 @@ func Start(cfg *config.Config, mode string) {
 	if mode == "dev" {
 		// 🔓 MODO DESARROLLO: solo HTTP
 		addr := cfg.Port
-		if cfg.Host != "" {
-			addr = cfg.Host + ":" + cfg.Port
+		if cfg.Host != "localhost" {
+			addr = "localhost" + ":" + cfg.Port
 		} // o configurable desde cfg.Port si quieres
-		log.Printf("[DEV] Servidor HTTP iniciado en http://localhost%s", addr)
+		log.Printf("[DEV] Servidor HTTP iniciado en http://%s", addr)
 		server := &http.Server{
 			Addr:    addr,
 			Handler: mux,
@@ -140,6 +144,24 @@ func corsMiddleware(domain string, next http.Handler) http.Handler {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func securityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Seguridad general del navegador
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+
+		// Forzar HTTPS en el navegador (HSTS)
+		w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
+
+		// Protección básica de contenido (opcional, según tu app)
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		w.Header().Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
 
 		next.ServeHTTP(w, r)
 	})
