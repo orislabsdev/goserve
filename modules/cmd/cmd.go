@@ -15,6 +15,7 @@ func Run() {
 		staticDir  = flag.String("dir", "", "Ruta a los archivos estáticos")
 		backendURL = flag.String("backend", "", "URL del backend")
 		passphrase = flag.String("key-pass", "changeme", "Frase secreta para desencriptar/generar claves")
+		domain     = flag.String("domain", "", "Domain of the server")
 	)
 
 	flag.Parse()
@@ -33,6 +34,10 @@ func Run() {
 	}
 	if *backendURL != "" {
 		cfg.BackendURL = *backendURL
+	}
+
+	if *domain != "" {
+		cfg.Domain = *domain
 	}
 
 	server.Start(cfg, *mode)

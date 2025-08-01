@@ -14,9 +14,10 @@ type Config struct {
 	SecurityKey crypto.SecurityKey
 	StaticDir   string
 	BackendURL  string
+	Domain      string
 }
 
-func NewConfig(port string, host string, securityKey crypto.SecurityKey, staticDir string, backend string) *Config {
+func NewConfig(port string, host string, securityKey crypto.SecurityKey, staticDir string, backend string, domain string) *Config {
 	if port == "" {
 		port = PORT
 	}
@@ -31,12 +32,17 @@ func NewConfig(port string, host string, securityKey crypto.SecurityKey, staticD
 		backend = BACKEND_URL
 	}
 
+	if domain == "" {
+		domain = DOMAIN
+	}
+
 	return &Config{
 		Port:        port,
 		Host:        host,
 		SecurityKey: securityKey,
 		StaticDir:   staticDir,
 		BackendURL:  backend,
+		Domain:      domain,
 	}
 }
 
@@ -59,7 +65,7 @@ func DefaultConfig(passphrase string) *Config {
 		securityKey = sk
 	}
 
-	return NewConfig(PORT, HOST, securityKey, STATIC_DIR_PATH, BACKEND_URL)
+	return NewConfig(PORT, HOST, securityKey, STATIC_DIR_PATH, BACKEND_URL, DOMAIN)
 }
 
 func loadSecurityKey(path string, passphrase string) crypto.SecurityKey {

@@ -61,7 +61,7 @@ func Start(cfg *config.Config, mode string) {
 	certManager := autocert.Manager{
 		Cache:      autocert.DirCache(".certs"),
 		Prompt:     autocert.AcceptTOS,
-		HostPolicy: autocert.HostWhitelist(cfg.Host),
+		HostPolicy: autocert.HostWhitelist(cfg.Domain),
 	}
 
 	// Redirección HTTP a HTTPS + ACME
@@ -74,12 +74,12 @@ func Start(cfg *config.Config, mode string) {
 	}()
 
 	server := &http.Server{
-		Addr:      ":443",
+		Addr:      cfg.Host + ":443",
 		Handler:   mux,
 		TLSConfig: certManager.TLSConfig(),
 	}
 
-	log.Printf("[HTTPS] Servidor seguro iniciado en https://%s", cfg.Host)
+	log.Printf("[HTTPS] Servidor seguro iniciado en https://%s", cfg.Domain)
 	if err := server.ListenAndServeTLS("", ""); err != nil {
 		log.Fatalf("Error en servidor HTTPS con autocert: %v", err)
 	}

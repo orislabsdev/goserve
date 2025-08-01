@@ -8,4 +8,5 @@ var (
 	BASE_PATH       = ".go-server"
 	BACKEND_URL     = "http://localhost:4000"
 	CERT_PATH       = "./cert"
+	DOMAIN          = "localhost"
 )
