@@ -9,4 +9,6 @@ var (
 	BACKEND_URL     = "http://localhost:4000"
 	CERT_PATH       = "./cert"
 	DOMAIN          = "localhost"
+	TLS_CERT_FILE   = ""
+	TLS_KEY_FILE    = ""
 )

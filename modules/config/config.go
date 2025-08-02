@@ -15,9 +15,11 @@ type Config struct {
 	StaticDir   string
 	BackendURL  string
 	Domain      string
+	TLSCertFile string
+	TLSKeyFile  string
 }
 
-func NewConfig(port string, host string, securityKey crypto.SecurityKey, staticDir string, backend string, domain string) *Config {
+func NewConfig(port string, host string, securityKey crypto.SecurityKey, staticDir string, backend string, domain string, tlsCert string, tlsKey string) *Config {
 	if port == "" {
 		port = PORT
 	}
@@ -43,6 +45,8 @@ func NewConfig(port string, host string, securityKey crypto.SecurityKey, staticD
 		StaticDir:   staticDir,
 		BackendURL:  backend,
 		Domain:      domain,
+		TLSCertFile: tlsCert,
+		TLSKeyFile:  tlsKey,
 	}
 }
 
@@ -65,7 +69,7 @@ func DefaultConfig(passphrase string) *Config {
 		securityKey = sk
 	}
 
-	return NewConfig(PORT, HOST, securityKey, STATIC_DIR_PATH, BACKEND_URL, DOMAIN)
+	return NewConfig(PORT, HOST, securityKey, STATIC_DIR_PATH, BACKEND_URL, DOMAIN, TLS_CERT_FILE, TLS_KEY_FILE)
 }
 
 func loadSecurityKey(path string, passphrase string) crypto.SecurityKey {

@@ -9,13 +9,15 @@ import (
 
 func Run() {
 	var (
-		mode       = flag.String("mode", "prod", "Modo del servidor: dev o prod")
-		port       = flag.String("port", "", "Puerto HTTPS (opcional)")
-		host       = flag.String("host", "", "Dominio o IP principal")
-		staticDir  = flag.String("dir", "", "Ruta a los archivos estáticos")
-		backendURL = flag.String("backend", "", "URL del backend")
-		passphrase = flag.String("key-pass", "changeme", "Frase secreta para desencriptar/generar claves")
-		domain     = flag.String("domain", "", "Domain of the server")
+		mode        = flag.String("mode", "prod", "Modo del servidor: dev o prod")
+		port        = flag.String("port", "", "Puerto HTTPS (opcional)")
+		host        = flag.String("host", "", "Dominio o IP principal")
+		staticDir   = flag.String("dir", "", "Ruta a los archivos estáticos")
+		backendURL  = flag.String("backend", "", "URL del backend")
+		passphrase  = flag.String("key-pass", "changeme", "Frase secreta para desencriptar/generar claves")
+		domain      = flag.String("domain", "", "Domain of the server")
+		TLSCertFile = flag.String("tls-cert", "", "Path to TLS certificate")
+		TLSKeyFile  = flag.String("tls-key", "", "Path to TLS key")
 	)
 
 	flag.Parse()
@@ -38,6 +40,14 @@ func Run() {
 
 	if *domain != "" {
 		cfg.Domain = *domain
+	}
+
+	if *TLSCertFile != "" {
+		cfg.TLSCertFile = *TLSCertFile
+	}
+
+	if *TLSKeyFile != "" {
+		cfg.TLSKeyFile = *TLSKeyFile
 	}
 
 	server.Start(cfg, *mode)

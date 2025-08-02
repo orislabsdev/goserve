@@ -2,8 +2,10 @@ package server
 
 import (
 	"compress/gzip"
+	"crypto/tls"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -20,17 +22,19 @@ import (
 func Start(cfg *config.Config, mode string) {
 	apiProxy := proxyAPIHandler(cfg.BackendURL)
 
-	apiHandler := corsMiddleware(cfg.Host,
+	apiHandler := corsMiddleware(cfg.Domain,
 		securityHeadersMiddleware(
 			loggingMiddleware(apiProxy),
 		),
 	)
 
-	staticHandler := corsMiddleware(cfg.Host,
+	staticHandler := corsMiddleware(cfg.Domain,
 		securityHeadersMiddleware(
-			gzipMiddleware(
-				loggingMiddleware(
-					http.HandlerFunc(staticHandler(cfg.StaticDir, apiProxy)),
+			restrictToCloudflare(
+				gzipMiddleware(
+					loggingMiddleware(
+						http.HandlerFunc(staticHandler(cfg.StaticDir, apiProxy)),
+					),
 				),
 			),
 		),
@@ -40,48 +44,62 @@ func Start(cfg *config.Config, mode string) {
 	mux.Handle("/api/", apiHandler)
 	mux.Handle("/", staticHandler)
 
+	// MODO DESARROLLO
 	if mode == "dev" {
-		// 🔓 MODO DESARROLLO: solo HTTP
-		addr := cfg.Port
-		if cfg.Host != "localhost" {
-			addr = "localhost" + ":" + cfg.Port
-		} // o configurable desde cfg.Port si quieres
-		log.Printf("[DEV] Servidor HTTP iniciado en http://%s", addr)
+		addr := cfg.Host + ":" + cfg.Port
+		log.Printf("[DEV] Servidor HTTP en http://%s", addr)
 		server := &http.Server{
 			Addr:    addr,
 			Handler: mux,
 		}
 		if err := server.ListenAndServe(); err != nil {
-			log.Fatalf("Error en servidor dev HTTP: %v", err)
+			log.Fatalf("Error HTTP dev: %v", err)
 		}
 		return
 	}
 
-	// 🔐 MODO PRODUCCIÓN: HTTPS con autocert + redirección desde HTTP
-	certManager := autocert.Manager{
-		Cache:      autocert.DirCache(".certs"),
-		Prompt:     autocert.AcceptTOS,
-		HostPolicy: autocert.HostWhitelist(cfg.Domain),
-	}
-
-	// Redirección HTTP a HTTPS + ACME
-	go func() {
-		log.Printf("[HTTP] Sirviendo challenge ACME y redirigiendo HTTP -> HTTPS en :80")
-		err := http.ListenAndServe(":80", certManager.HTTPHandler(nil))
-		if err != nil {
-			log.Fatalf("Error en servidor HTTP para autocert: %v", err)
-		}
-	}()
+	// MODO PRODUCCIÓN
+	useAutocert := (cfg.TLSCertFile == "" || cfg.TLSKeyFile == "")
+	addr := cfg.Host + ":443"
 
 	server := &http.Server{
-		Addr:      cfg.Host + ":443",
-		Handler:   mux,
-		TLSConfig: certManager.TLSConfig(),
+		Addr:    addr,
+		Handler: mux,
+		TLSConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
 	}
 
-	log.Printf("[HTTPS] Servidor seguro iniciado en https://%s", cfg.Domain)
-	if err := server.ListenAndServeTLS("", ""); err != nil {
-		log.Fatalf("Error en servidor HTTPS con autocert: %v", err)
+	if useAutocert {
+		// 🌐 Certificado automático (Cloudflare en modo Full sin Strict y proxy ☁️ desactivado)
+		log.Println("[TLS] Usando autocert (Let's Encrypt)")
+
+		certManager := autocert.Manager{
+			Cache:      autocert.DirCache(".certs"),
+			Prompt:     autocert.AcceptTOS,
+			HostPolicy: autocert.HostWhitelist(cfg.Domain),
+		}
+
+		// Redirección HTTP → HTTPS y validación de ACME
+		go func() {
+			log.Println("[HTTP] Sirviendo ACME challenge y redirigiendo HTTP → HTTPS en :80")
+			if err := http.ListenAndServe(":80", certManager.HTTPHandler(nil)); err != nil {
+				log.Fatalf("Error en HTTP (ACME): %v", err)
+			}
+		}()
+
+		server.TLSConfig.GetCertificate = certManager.GetCertificate
+		log.Printf("[HTTPS] Servidor HTTPS (autocert) iniciado en https://%s", cfg.Domain)
+		if err := server.ListenAndServeTLS("", ""); err != nil {
+			log.Fatalf("Error HTTPS autocert: %v", err)
+		}
+	} else {
+		// 🔐 Certificados proporcionados manualmente (Cloudflare en modo Full Strict)
+		log.Println("[TLS] Usando certificados TLS proporcionados (Full Strict)")
+		log.Printf("[HTTPS] Servidor HTTPS (cert manual) iniciado en https://%s", cfg.Domain)
+		if err := server.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil {
+			log.Fatalf("Error HTTPS manual: %v", err)
+		}
 	}
 }
 
@@ -100,6 +118,75 @@ func proxyAPIHandler(backendURL string) http.Handler {
 		req.Header.Set("X-Forwarded-Host", req.Host)
 	}
 	return proxy
+}
+
+func restrictToCloudflare(next http.Handler) http.Handler {
+	cloudflareCIDRs := []string{
+		// Cloudflare IPv4 (puedes agregar más)
+		"173.245.48.0/20",
+		"103.21.244.0/22",
+		"103.22.200.0/22",
+		"103.31.4.0/22",
+		"141.101.64.0/18",
+		"108.162.192.0/18",
+		"190.93.240.0/20",
+		"188.114.96.0/20",
+		"197.234.240.0/22",
+		"198.41.128.0/17",
+		"162.158.0.0/15",
+		"104.16.0.0/13",
+		"104.24.0.0/14",
+		"172.64.0.0/13",
+		"131.0.72.0/22",
+
+		// Cloudflare IPv6 (opcional)
+		"2400:cb00::/32",
+		"2606:4700::/32",
+		"2803:f800::/32",
+		"2405:b500::/32",
+		"2405:8100::/32",
+		"2a06:98c0::/29",
+		"2c0f:f248::/32",
+	}
+
+	var cloudflareNets []*net.IPNet
+	for _, cidr := range cloudflareCIDRs {
+		_, network, err := net.ParseCIDR(cidr)
+		if err == nil {
+			cloudflareNets = append(cloudflareNets, network)
+		}
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Extraer IP del RemoteAddr
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			http.Error(w, "403 Forbidden", http.StatusForbidden)
+			return
+		}
+		ip := net.ParseIP(host)
+		if ip == nil {
+			http.Error(w, "403 Forbidden", http.StatusForbidden)
+			return
+		}
+
+		// Verificar si IP está en la lista de Cloudflare
+		allowed := false
+		for _, net := range cloudflareNets {
+			if net.Contains(ip) {
+				allowed = true
+				break
+			}
+		}
+
+		if !allowed {
+			log.Printf("[SECURITY] IP no autorizada (no es de Cloudflare): %s", ip)
+			http.Error(w, "403 Forbidden", http.StatusForbidden)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 func staticHandler(staticDir string, apiProxy http.Handler) http.HandlerFunc {
