@@ -9,17 +9,20 @@ import (
 )
 
 type Config struct {
-	Port        string
-	Host        string
-	SecurityKey crypto.SecurityKey
-	StaticDir   string
-	BackendURL  string
-	Domain      string
-	TLSCertFile string
-	TLSKeyFile  string
+	Port           string
+	Host           string
+	SecurityKey    crypto.SecurityKey
+	StaticDir      string
+	BackendURL     string
+	Domain         string
+	TLSCertFile    string
+	TLSKeyFile     string
+	AuthToken      string
+	AuthEnabled    bool
+	InternalSecret string
 }
 
-func NewConfig(port string, host string, securityKey crypto.SecurityKey, staticDir string, backend string, domain string, tlsCert string, tlsKey string) *Config {
+func NewConfig(port string, host string, securityKey crypto.SecurityKey, staticDir string, backend string, domain string, tlsCert string, tlsKey string, authEnabled bool) *Config {
 	if port == "" {
 		port = PORT
 	}
@@ -38,19 +41,42 @@ func NewConfig(port string, host string, securityKey crypto.SecurityKey, staticD
 		domain = DOMAIN
 	}
 
+	if tlsCert == "" {
+		tlsCert = TLS_CERT_FILE
+	}
+
+	if tlsKey == "" {
+		tlsKey = TLS_KEY_FILE
+	}
+
+	var authToken string
+	var err error
+	if authEnabled {
+		authToken, err = crypto.GenerateAuthToken(securityKey.PubKey)
+		if err != nil {
+			log.Fatalf("failed to generate auth token: %v", err)
+		}
+		log.Printf("Generated auth token: %s", authToken)
+	} else {
+		authToken = ""
+	}
+
 	return &Config{
-		Port:        port,
-		Host:        host,
-		SecurityKey: securityKey,
-		StaticDir:   staticDir,
-		BackendURL:  backend,
-		Domain:      domain,
-		TLSCertFile: tlsCert,
-		TLSKeyFile:  tlsKey,
+		Port:           port,
+		Host:           host,
+		SecurityKey:    securityKey,
+		StaticDir:      staticDir,
+		BackendURL:     backend,
+		Domain:         domain,
+		TLSCertFile:    tlsCert,
+		TLSKeyFile:     tlsKey,
+		AuthToken:      authToken,
+		AuthEnabled:    authEnabled,
+		InternalSecret: INTERNAL_SECRET,
 	}
 }
 
-func DefaultConfig(passphrase string) *Config {
+func DefaultConfig(passphrase string, authEnabled bool) *Config {
 	var securityKey crypto.SecurityKey
 	path := getPath()
 
@@ -69,7 +95,7 @@ func DefaultConfig(passphrase string) *Config {
 		securityKey = sk
 	}
 
-	return NewConfig(PORT, HOST, securityKey, STATIC_DIR_PATH, BACKEND_URL, DOMAIN, TLS_CERT_FILE, TLS_KEY_FILE)
+	return NewConfig(PORT, HOST, securityKey, STATIC_DIR_PATH, BACKEND_URL, DOMAIN, TLS_CERT_FILE, TLS_KEY_FILE, authEnabled)
 }
 
 func loadSecurityKey(path string, passphrase string) crypto.SecurityKey {

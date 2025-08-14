@@ -191,3 +191,14 @@ func decryptWithPassphrase(passphrase, encryptedData []byte) ([]byte, error) {
 
 	return plaintext, nil
 }
+
+func GenerateAuthToken(pub pec256.PubKey) (string, error) {
+	if pub.BigInt() == nil {
+		return "", fmt.Errorf("public key is nil")
+	}
+
+	h := NewPM256()
+	h.Write(pub.BigInt().Bytes())
+	token := fmt.Sprintf("%x", h.Sum(nil))
+	return token, nil
+}

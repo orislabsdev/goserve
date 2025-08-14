@@ -20,7 +20,7 @@ import (
 )
 
 func Start(cfg *config.Config, mode string) {
-	apiProxy := proxyAPIHandler(cfg.BackendURL)
+	apiProxy := proxyAPIHandler(cfg)
 
 	apiHandler := corsMiddleware(cfg.Domain,
 		securityHeadersMiddleware(
@@ -28,25 +28,44 @@ func Start(cfg *config.Config, mode string) {
 		),
 	)
 
-	staticHandler := corsMiddleware(cfg.Domain,
-		securityHeadersMiddleware(
-			restrictToCloudflare(
+	var handler http.Handler
+
+	if mode == "dev" {
+		handler = corsMiddleware(cfg.Domain,
+			securityHeadersMiddleware(
 				gzipMiddleware(
 					loggingMiddleware(
 						http.HandlerFunc(staticHandler(cfg.StaticDir, apiProxy)),
 					),
 				),
 			),
-		),
-	)
+		)
+	} else {
+		handler = corsMiddleware(cfg.Domain,
+			securityHeadersMiddleware(
+				restrictToCloudflare(
+					gzipMiddleware(
+						loggingMiddleware(
+							http.HandlerFunc(staticHandler(cfg.StaticDir, apiProxy)),
+						),
+					),
+				),
+			),
+		)
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/api/", apiHandler)
-	mux.Handle("/", staticHandler)
+	mux.Handle("/", handler)
 
 	// MODO DESARROLLO
 	if mode == "dev" {
+		if cfg.Host != "127.0.0.1" {
+			cfg.Host = "127.0.0.1"
+		}
+
 		addr := cfg.Host + ":" + cfg.Port
+
 		log.Printf("[DEV] Servidor HTTP en http://%s", addr)
 		server := &http.Server{
 			Addr:    addr,
@@ -105,8 +124,8 @@ func Start(cfg *config.Config, mode string) {
 
 // === Handlers y middleware igual que antes ===
 
-func proxyAPIHandler(backendURL string) http.Handler {
-	target, err := url.Parse(backendURL)
+func proxyAPIHandler(cfg *config.Config) http.Handler {
+	target, err := url.Parse(cfg.BackendURL)
 	if err != nil {
 		log.Fatalf("Backend URL inválida: %v", err)
 	}
@@ -116,8 +135,20 @@ func proxyAPIHandler(backendURL string) http.Handler {
 		original(req)
 		req.Host = target.Host
 		req.Header.Set("X-Forwarded-Host", req.Host)
+
+		// Token de tu configuración (solo lo conoce tu server)
+		// ESTO se agrega automáticamente al hacer proxy al backend
+		req.Header.Set("X-Internal-Auth", cfg.InternalSecret)
+
+		// Autenticación ya existente si la tienes
+		if cfg.AuthEnabled && cfg.AuthToken != "" {
+			req.Header.Set("Authorization", "Bearer "+cfg.AuthToken)
+		}
 	}
-	return proxy
+
+	// IMPORTANTE: Aplicar middleware de seguridad ANTES del proxy
+	// Esto valida que la request venga del frontend, no directamente del navegador
+	return frontendValidationMiddleware(cfg, proxy)
 }
 
 func restrictToCloudflare(next http.Handler) http.Handler {
@@ -219,13 +250,66 @@ func staticHandler(staticDir string, apiProxy http.Handler) http.HandlerFunc {
 func corsMiddleware(domain string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if origin != "" && (strings.Contains(origin, domain) || strings.Contains(origin, "localhost")) {
-			w.Header().Set("Access-Control-Allow-Origin", origin) // ← usa el origin dinámicamente
+		referer := r.Header.Get("Referer")
+
+		// Lista de orígenes permitidos
+		allowedOrigins := []string{
+			"https://" + domain,
+			"https://www." + domain,
+			"http://localhost:8080", // Para desarrollo
+			"http://127.0.0.1:3000",
+			"http://127.0.0.1:8080",
 		}
 
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		// Verificar si el origin está permitido
+		originAllowed := false
+		if origin != "" {
+			for _, allowed := range allowedOrigins {
+				if origin == allowed {
+					originAllowed = true
+					break
+				}
+			}
+		}
+
+		// Para requests sin origin (como algunos mobile apps), verificar referer
+		if !originAllowed && origin == "" {
+			for _, allowed := range allowedOrigins {
+				if strings.HasPrefix(referer, allowed) {
+					originAllowed = true
+					origin = allowed // Asignar para el header de respuesta
+					break
+				}
+			}
+		}
+
+		// Solo para rutas API, ser más estricto
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			// Para API, requerir origin válido
+			if !originAllowed {
+				log.Printf("[CORS] Origin no permitido para API: %s (referer: %s)", origin, referer)
+				http.Error(w, "403 Forbidden - Invalid Origin", http.StatusForbidden)
+				return
+			}
+
+			// Verificar User-Agent para APIs (opcional - bloquear curl, wget, etc)
+			userAgent := r.Header.Get("User-Agent")
+			if isBlockedUserAgent(userAgent) {
+				log.Printf("[CORS] User-Agent bloqueado: %s", userAgent)
+				http.Error(w, "403 Forbidden - Invalid User-Agent", http.StatusForbidden)
+				return
+			}
+		}
+
+		// Establecer headers CORS solo si el origin está permitido
+		if originAllowed {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		}
+
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Internal-Auth")
 		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		w.Header().Set("Access-Control-Max-Age", "86400") // Cache preflight por 24h
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -234,6 +318,74 @@ func corsMiddleware(domain string, next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+// Función auxiliar para bloquear ciertos User-Agents
+func isBlockedUserAgent(userAgent string) bool {
+	blockedAgents := []string{
+		"curl",
+		"wget",
+		"python-requests",
+		"Postman",
+		"Insomnia",
+		"HTTPie",
+		"Go-http-client",
+		"okhttp",
+	}
+
+	userAgentLower := strings.ToLower(userAgent)
+	for _, blocked := range blockedAgents {
+		if strings.Contains(userAgentLower, strings.ToLower(blocked)) {
+			return true
+		}
+	}
+
+	return false
+}
+
+/* // Cache simple para rate limiting (en producción usa Redis)
+var rateLimitCache = make(map[string][]time.Time)
+
+func isRateLimited(ip string) bool {
+	now := time.Now()
+	windowDuration := 1 * time.Minute
+	maxRequests := 60 // 60 requests por minuto
+
+	// Limpiar requests antiguos
+	requests := rateLimitCache[ip]
+	validRequests := make([]time.Time, 0)
+
+	for _, reqTime := range requests {
+		if now.Sub(reqTime) < windowDuration {
+			validRequests = append(validRequests, reqTime)
+		}
+	}
+
+	// Agregar request actual
+	validRequests = append(validRequests, now)
+	rateLimitCache[ip] = validRequests
+
+	return len(validRequests) > maxRequests
+} */
+
+func isValidBrowserUserAgent(userAgent string) bool {
+	// User-agents válidos de navegadores principales
+	validBrowsers := []string{
+		"Mozilla/5.0", // Chrome, Firefox, Safari, Edge
+		"WebKit",      // Safari, Chrome
+		"Gecko",       // Firefox
+		"Chrome",      // Chrome, Edge
+		"Safari",      // Safari
+		"Edge",        // Edge
+	}
+
+	for _, browser := range validBrowsers {
+		if strings.Contains(userAgent, browser) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func securityHeadersMiddleware(next http.Handler) http.Handler {
@@ -284,4 +436,101 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 		log.Printf("[%s] %s %s", r.Method, r.URL.Path, time.Since(start))
 	})
+}
+
+// Middleware para validar que las requests vienen del frontend legítimo
+func frontendValidationMiddleware(cfg *config.Config, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		/* // 1. Rate limiting básico por IP
+		if isRateLimited(r.RemoteAddr) {
+			http.Error(w, "429 Too Many Requests", http.StatusTooManyRequests)
+			return
+		} */
+
+		// 2. Verificar que tenga headers de navegador válidos
+		if !hasValidBrowserHeaders(r) {
+			log.Printf("[SECURITY] Request sin headers de navegador válidos desde: %s", r.RemoteAddr)
+			http.Error(w, "403 Forbidden - Invalid Headers", http.StatusForbidden)
+			return
+		}
+
+		// 3. Verificar que venga de JavaScript fetch/XMLHttpRequest
+		if !isValidAjaxRequest(r) {
+			log.Printf("[SECURITY] Request no es AJAX válido desde: %s", r.RemoteAddr)
+			http.Error(w, "403 Forbidden - Direct Access Not Allowed", http.StatusForbidden)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Validar que sea una request AJAX legítima
+func isValidAjaxRequest(r *http.Request) bool {
+	// Debug: imprimir headers para diagnosticar
+	log.Printf("[DEBUG] Method: %s, Accept: %s", r.Method, r.Header.Get("Accept"))
+	log.Printf("[DEBUG] Sec-Fetch-Site: %s, Sec-Fetch-Mode: %s",
+		r.Header.Get("Sec-Fetch-Site"), r.Header.Get("Sec-Fetch-Mode"))
+
+	accept := r.Header.Get("Accept")
+
+	// 1. Para fetch() sin especificar Accept, viene como "*/*"
+	if accept == "" {
+		return false
+	}
+
+	// 2. Verificar headers de seguridad del navegador (si están presentes)
+	secFetchSite := r.Header.Get("Sec-Fetch-Site")
+	secFetchMode := r.Header.Get("Sec-Fetch-Mode")
+
+	if secFetchSite != "" {
+		// Si existe, debe ser same-origin o none (para localhost)
+		if secFetchSite != "same-origin" && secFetchSite != "none" {
+			return false
+		}
+	}
+
+	if secFetchMode != "" {
+		// Si existe, debe ser cors, navigate, o no-cors
+		if secFetchMode != "cors" && secFetchMode != "navigate" && secFetchMode != "no-cors" {
+			return false
+		}
+	}
+
+	// 3. Para POST/PUT/DELETE, verificar Content-Type solo si se envía body
+	if r.Method != "GET" && r.Method != "OPTIONS" && r.Method != "HEAD" {
+		contentType := r.Header.Get("Content-Type")
+		if contentType != "" && !strings.Contains(contentType, "application/json") {
+			return false
+		}
+	}
+
+	return true
+}
+
+// Versión mejorada de validación de headers de navegador
+func hasValidBrowserHeaders(r *http.Request) bool {
+	userAgent := r.Header.Get("User-Agent")
+	accept := r.Header.Get("Accept")
+
+	// Debug: imprimir headers importantes
+	log.Printf("[DEBUG] User-Agent: %s", userAgent)
+	log.Printf("[DEBUG] Accept: %s", accept)
+
+	// Debe tener User-Agent de navegador
+	if userAgent == "" || !isValidBrowserUserAgent(userAgent) {
+		return false
+	}
+
+	// Debe tener header Accept
+	if accept == "" {
+		return false
+	}
+
+	// Accept puede ser "*/*" (fetch por defecto) o incluir application/json
+	validAccept := strings.Contains(accept, "*/*") || 
+				  strings.Contains(accept, "application/json") ||
+				  strings.Contains(accept, "text/html")
+
+	return validAccept
 }

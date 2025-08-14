@@ -11,4 +11,5 @@ var (
 	DOMAIN          = "localhost"
 	TLS_CERT_FILE   = ""
 	TLS_KEY_FILE    = ""
+	INTERNAL_SECRET = "b1e016c9dff7430b9ce31d8ef343b3882aa9ca534950fc32f14718c3ab73ef48"
 )

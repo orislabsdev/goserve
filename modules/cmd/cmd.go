@@ -18,11 +18,12 @@ func Run() {
 		domain      = flag.String("domain", "", "Domain of the server")
 		TLSCertFile = flag.String("tls-cert", "", "Path to TLS certificate")
 		TLSKeyFile  = flag.String("tls-key", "", "Path to TLS key")
+		auth        = flag.Bool("auth", false, "Enable authentication for backend requests")
 	)
 
 	flag.Parse()
 
-	cfg := config.DefaultConfig(*passphrase)
+	cfg := config.DefaultConfig(*passphrase, *auth)
 
 	// Si los flags fueron provistos, actualizan los valores por defecto
 	if *port != "" {
