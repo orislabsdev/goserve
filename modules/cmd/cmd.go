@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"flag"
+	"log"
+	"strings"
 
 	"github.com/polarysfoundation/go-server/modules/config"
 	"github.com/polarysfoundation/go-server/modules/server"
@@ -9,47 +11,30 @@ import (
 
 func Run() {
 	var (
-		mode        = flag.String("mode", "prod", "Modo del servidor: dev o prod")
-		port        = flag.String("port", "", "Puerto HTTPS (opcional)")
-		host        = flag.String("host", "", "Dominio o IP principal")
-		staticDir   = flag.String("dir", "", "Ruta a los archivos estáticos")
-		backendURL  = flag.String("backend", "", "URL del backend")
-		passphrase  = flag.String("key-pass", "changeme", "Frase secreta para desencriptar/generar claves")
-		domain      = flag.String("domain", "", "Domain of the server")
-		TLSCertFile = flag.String("tls-cert", "", "Path to TLS certificate")
-		TLSKeyFile  = flag.String("tls-key", "", "Path to TLS key")
-		auth        = flag.Bool("auth", false, "Enable authentication for backend requests")
+		configPath = flag.String("config", "", "Path del archivo de configuración")
 	)
 
 	flag.Parse()
 
-	cfg := config.DefaultConfig(*passphrase, *auth)
-
-	// Si los flags fueron provistos, actualizan los valores por defecto
-	if *port != "" {
-		cfg.Port = *port
+	var cfg *config.Config
+	var err error
+	if *configPath != "" && strings.HasSuffix(*configPath, ".json") {
+		log.Printf("Using config file: %s", *configPath)
+		cfg, err = config.LoadConfig(*configPath)
+	} else if *configPath != "" && strings.HasSuffix(*configPath, ".env") {
+		log.Println("Using environment variables")
+		cfg, err = config.LoadFromEnv(*configPath)
+	} else {
+		panic("Invalid config path")
 	}
-	if *host != "" {
-		cfg.Host = *host
-	}
-	if *staticDir != "" {
-		cfg.StaticDir = *staticDir
-	}
-	if *backendURL != "" {
-		cfg.BackendURL = *backendURL
-	}
-
-	if *domain != "" {
-		cfg.Domain = *domain
+	if err != nil {
+		log.Fatalf("Error loading config: %v", err)
 	}
 
-	if *TLSCertFile != "" {
-		cfg.TLSCertFile = *TLSCertFile
+	mode := "prod"
+	if cfg.DevMode {
+		mode = "dev"
 	}
 
-	if *TLSKeyFile != "" {
-		cfg.TLSKeyFile = *TLSKeyFile
-	}
-
-	server.Start(cfg, *mode)
+	server.Start(cfg, mode)
 }

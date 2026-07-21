@@ -1,1 +1,11 @@
 build
+dist
+go-server
+.certs/
+server.env
+.env
+*.env
+!config.example.json
+config.json
+.DS_Store
+goserve-linux

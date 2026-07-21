@@ -1,0 +1,16 @@
+{
+  "host": "127.0.0.1",
+  "port": "8080",
+  "domain": "example.com",
+  "tls_cert_file": "",
+  "tls_key_file": "",
+  "admin_email": "admin@example.com",
+  "backend_url": "http://127.0.0.1:4000",
+  "ws_path": "/ws",
+  "rate_limit_enabled": true,
+  "rate_limit": 50,
+  "rate_burst": 100,
+  "require_cloudflare": false,
+  "static_dir": "./dist/spa",
+  "dev_mode": true
+}

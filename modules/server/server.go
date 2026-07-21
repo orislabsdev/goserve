@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bufio"
 	"compress/gzip"
 	"crypto/tls"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -12,64 +15,193 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/time/rate"
 
 	"github.com/polarysfoundation/go-server/modules/config"
 )
 
-func Start(cfg *config.Config, mode string) {
-	apiProxy := proxyAPIHandler(cfg)
+var errPathTraversal = errors.New("path traversal")
 
-	apiHandler := corsMiddleware(cfg.Domain,
-		securityHeadersMiddleware(
-			loggingMiddleware(apiProxy),
-		),
-	)
+// RateLimiter limita por IP (en producción considerar Redis si hay varias réplicas).
+type RateLimiter struct {
+	visitors map[string]*rate.Limiter
+	mu       sync.RWMutex
+	rate     rate.Limit
+	burst    int
+}
 
-	var handler http.Handler
+func NewRateLimiter(r rate.Limit, b int) *RateLimiter {
+	rl := &RateLimiter{
+		visitors: make(map[string]*rate.Limiter),
+		rate:     r,
+		burst:    b,
+	}
+	go rl.cleanupVisitors()
+	return rl
+}
 
-	if mode == "dev" {
-		handler = corsMiddleware(cfg.Domain,
-			securityHeadersMiddleware(
-				gzipMiddleware(
-					loggingMiddleware(
-						http.HandlerFunc(staticHandler(cfg.StaticDir, apiProxy)),
-					),
-				),
-			),
-		)
-	} else {
-		handler = corsMiddleware(cfg.Domain,
-			securityHeadersMiddleware(
-				restrictToCloudflare(
-					gzipMiddleware(
-						loggingMiddleware(
-							http.HandlerFunc(staticHandler(cfg.StaticDir, apiProxy)),
-						),
-					),
-				),
-			),
-		)
+func (rl *RateLimiter) GetLimiter(ip string) *rate.Limiter {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	limiter, exists := rl.visitors[ip]
+	if !exists {
+		limiter = rate.NewLimiter(rl.rate, rl.burst)
+		rl.visitors[ip] = limiter
+	}
+	return limiter
+}
+
+func (rl *RateLimiter) cleanupVisitors() {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		rl.mu.Lock()
+		for ip := range rl.visitors {
+			delete(rl.visitors, ip)
+		}
+		rl.mu.Unlock()
+	}
+}
+
+// CloudflareIPManager opcional: solo si REQUIRE_CLOUDFLARE=true.
+type CloudflareIPManager struct {
+	ipv4Nets   []*net.IPNet
+	ipv6Nets   []*net.IPNet
+	mu         sync.RWMutex
+	lastUpdate time.Time
+}
+
+func NewCloudflareIPManager() *CloudflareIPManager {
+	cm := &CloudflareIPManager{}
+	cm.updateIPs()
+	go func() {
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			cm.updateIPs()
+		}
+	}()
+	return cm
+}
+
+func (cm *CloudflareIPManager) updateIPs() {
+	ipv4CIDRs := fetchCloudflareCIDRs("https://www.cloudflare.com/ips-v4", []string{
+		"103.21.244.0/22", "104.16.0.0/13", "172.64.0.0/13",
+	})
+	ipv6CIDRs := fetchCloudflareCIDRs("https://www.cloudflare.com/ips-v6", []string{
+		"2400:cb00::/32", "2606:4700::/32", "2803:f800::/32",
+	})
+
+	var ipv4Nets, ipv6Nets []*net.IPNet
+	for _, cidr := range ipv4CIDRs {
+		if cidr != "" {
+			if _, network, err := net.ParseCIDR(cidr); err == nil {
+				ipv4Nets = append(ipv4Nets, network)
+			}
+		}
+	}
+	for _, cidr := range ipv6CIDRs {
+		if cidr != "" {
+			if _, network, err := net.ParseCIDR(cidr); err == nil {
+				ipv6Nets = append(ipv6Nets, network)
+			}
+		}
 	}
 
-	mux := http.NewServeMux()
-	mux.Handle("/api/", apiHandler)
-	mux.Handle("/", handler)
+	cm.mu.Lock()
+	cm.ipv4Nets = ipv4Nets
+	cm.ipv6Nets = ipv6Nets
+	cm.lastUpdate = time.Now()
+	cm.mu.Unlock()
 
-	// MODO DESARROLLO
-	if mode == "dev" {
-		if cfg.Host != "127.0.0.1" {
-			cfg.Host = "127.0.0.1"
+	log.Printf("[SECURITY] Rangos Cloudflare cargados: %d IPv4, %d IPv6", len(ipv4Nets), len(ipv6Nets))
+}
+
+func fetchCloudflareCIDRs(url string, fallback []string) []string {
+	resp, err := http.Get(url)
+	if err != nil {
+		log.Printf("[SECURITY] No se pudieron obtener IPs de Cloudflare (%s): %v", url, err)
+		return fallback
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return strings.Split(strings.TrimSpace(string(body)), "\n")
+}
+
+func (cm *CloudflareIPManager) IsCloudflareIP(ip net.IP) bool {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+
+	nets := cm.ipv4Nets
+	if ip.To4() == nil {
+		nets = cm.ipv6Nets
+	}
+	for _, network := range nets {
+		if network.Contains(ip) {
+			return true
 		}
+	}
+	return false
+}
 
+func Start(cfg *config.Config, mode string) {
+	if err := validateConfig(cfg, mode); err != nil {
+		log.Fatalf("Configuración inválida: %v", err)
+	}
+
+	dev := mode == "dev"
+	var rateLimiter *RateLimiter
+	if !dev && cfg.RateLimitEnabled {
+		rateLimiter = NewRateLimiter(rate.Limit(cfg.RateLimit), cfg.RateBurst)
+	}
+
+	var cfManager *CloudflareIPManager
+	if !dev && cfg.RequireCloudflare {
+		cfManager = NewCloudflareIPManager()
+		log.Println("[SECURITY] REQUIRE_CLOUDFLARE activo: solo tráfico desde IPs de Cloudflare")
+	}
+
+	backendProxy := proxyBackendHandler(cfg)
+	apiHandler := buildMiddlewareChain(cfg, dev, rateLimiter, cfManager, false, backendProxy)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+
+	if cfg.WebSocketProxyEnabled() {
+		wsHandler := buildMiddlewareChain(cfg, dev, rateLimiter, cfManager, false, backendProxy)
+		mux.Handle(cfg.WSPath, wsHandler)
+		log.Printf("[WS] Proxy WebSocket: %s → %s", cfg.WSPath, cfg.BackendURL)
+	} else if cfg.WSPath != "" {
+		log.Printf("[WS] WS_PATH=%q ignorado: el path debe contener \"ws\" (ej. /ws, /websocket)", cfg.WSPath)
+	}
+
+	mux.Handle("/api/", apiHandler)
+
+	staticHandler := buildMiddlewareChain(cfg, dev, rateLimiter, cfManager, true,
+		http.HandlerFunc(serveStatic(cfg.StaticDir, cfg.WSPath)))
+	mux.Handle("/", staticHandler)
+
+	if dev {
 		addr := cfg.Host + ":" + cfg.Port
+		log.Printf("[DEV] Servidor HTTP en http://%s (sin restricciones de API; CORS abierto)", addr)
+		log.Println("[DEV] La seguridad (JWT, CORS, etc.) la gestiona el backend")
 
-		log.Printf("[DEV] Servidor HTTP en http://%s", addr)
 		server := &http.Server{
-			Addr:    addr,
-			Handler: mux,
+			Addr:              addr,
+			Handler:           mux,
+			ReadTimeout:       30 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       120 * time.Second,
+			ReadHeaderTimeout: 10 * time.Second,
+			MaxHeaderBytes:    1 << 20,
 		}
 		if err := server.ListenAndServe(); err != nil {
 			log.Fatalf("Error HTTP dev: %v", err)
@@ -77,331 +209,352 @@ func Start(cfg *config.Config, mode string) {
 		return
 	}
 
-	// MODO PRODUCCIÓN
-	useAutocert := (cfg.TLSCertFile == "" || cfg.TLSKeyFile == "")
-	addr := cfg.Host + ":443"
+	startProduction(cfg, mux)
+}
+
+func buildMiddlewareChain(cfg *config.Config, dev bool, rl *RateLimiter, cf *CloudflareIPManager,
+	gzipEnabled bool, next http.Handler) http.Handler {
+	h := loggingMiddleware(next)
+
+	if gzipEnabled {
+		h = gzipMiddleware(h)
+	}
+
+	if dev {
+		h = devCORSMiddleware(h)
+		return h
+	}
+
+	if rl != nil {
+		h = rateLimitMiddleware(rl, true)(h)
+	}
+	if cf != nil {
+		h = cloudflareOnlyMiddleware(cf)(h)
+	}
+	h = productionSecurityHeadersMiddleware(h)
+	h = productionCORSMiddleware(h)
+	return h
+}
+
+func startProduction(cfg *config.Config, mux http.Handler) {
+	useAutocert := cfg.TLSCertFile == "" || cfg.TLSKeyFile == ""
+
+	tlsPort := "443"
+	if cfg.TLSPort != "" {
+		tlsPort = strings.TrimPrefix(cfg.TLSPort, ":")
+	}
+	addr := cfg.Host + ":" + tlsPort
 
 	server := &http.Server{
-		Addr:    addr,
-		Handler: mux,
+		Addr:              addr,
+		Handler:           mux,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 		TLSConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
+			CipherSuites: []uint16{
+				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+				tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+				tls.TLS_AES_128_GCM_SHA256,
+				tls.TLS_AES_256_GCM_SHA384,
+			},
 		},
 	}
 
 	if useAutocert {
-		// 🌐 Certificado automático (Cloudflare en modo Full sin Strict y proxy ☁️ desactivado)
 		log.Println("[TLS] Usando autocert (Let's Encrypt)")
-
 		certManager := autocert.Manager{
 			Cache:      autocert.DirCache(".certs"),
 			Prompt:     autocert.AcceptTOS,
 			HostPolicy: autocert.HostWhitelist(cfg.Domain),
+			Email:      cfg.AdminEmail,
 		}
 
-		// Redirección HTTP → HTTPS y validación de ACME
+		httpServer := &http.Server{
+			Addr:              ":" + cfg.Port,
+			Handler:           certManager.HTTPHandler(redirectToHTTPS()),
+			ReadTimeout:       10 * time.Second,
+			WriteTimeout:      10 * time.Second,
+			IdleTimeout:       60 * time.Second,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
 		go func() {
-			log.Println("[HTTP] Sirviendo ACME challenge y redirigiendo HTTP → HTTPS en :80")
-			if err := http.ListenAndServe(":80", certManager.HTTPHandler(nil)); err != nil {
+			if err := httpServer.ListenAndServe(); err != nil {
 				log.Fatalf("Error en HTTP (ACME): %v", err)
 			}
 		}()
 
 		server.TLSConfig.GetCertificate = certManager.GetCertificate
-		log.Printf("[HTTPS] Servidor HTTPS (autocert) iniciado en https://%s", cfg.Domain)
+		log.Printf("[HTTPS] Servidor en https://%s (proxy → %s)", cfg.Domain, cfg.BackendURL)
 		if err := server.ListenAndServeTLS("", ""); err != nil {
 			log.Fatalf("Error HTTPS autocert: %v", err)
 		}
-	} else {
-		// 🔐 Certificados proporcionados manualmente (Cloudflare en modo Full Strict)
-		log.Println("[TLS] Usando certificados TLS proporcionados (Full Strict)")
-		log.Printf("[HTTPS] Servidor HTTPS (cert manual) iniciado en https://%s", cfg.Domain)
-		if err := server.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil {
-			log.Fatalf("Error HTTPS manual: %v", err)
+		return
+	}
+
+	log.Println("[TLS] Usando certificados TLS manuales")
+	httpServer := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           redirectToHTTPS(),
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		if err := httpServer.ListenAndServe(); err != nil {
+			log.Fatalf("Error en HTTP: %v", err)
 		}
+	}()
+
+	log.Printf("[HTTPS] Servidor en https://%s (proxy → %s)", cfg.Domain, cfg.BackendURL)
+	if err := server.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil {
+		log.Fatalf("Error HTTPS manual: %v", err)
 	}
 }
 
-// === Handlers y middleware igual que antes ===
-
-func proxyAPIHandler(cfg *config.Config) http.Handler {
+func proxyBackendHandler(cfg *config.Config) http.Handler {
 	target, err := url.Parse(cfg.BackendURL)
 	if err != nil {
 		log.Fatalf("Backend URL inválida: %v", err)
 	}
+
+	if !isPrivateIP(target.Hostname()) && target.Hostname() != "localhost" {
+		log.Println("⚠️  El backend parece estar en red pública; asegúrate de que no sea accesible directamente")
+	}
+
 	proxy := httputil.NewSingleHostReverseProxy(target)
-	original := proxy.Director
+	proxy.Transport = &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+	}
+
+	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
-		original(req)
+		originalDirector(req)
 		req.Host = target.Host
-		req.Header.Set("X-Forwarded-Host", req.Host)
-
-		// Token de tu configuración (solo lo conoce tu server)
-		// ESTO se agrega automáticamente al hacer proxy al backend
-		req.Header.Set("X-Internal-Auth", cfg.InternalSecret)
-
-		// Autenticación ya existente si la tienes
-		if cfg.AuthEnabled && cfg.AuthToken != "" {
-			req.Header.Set("Authorization", "Bearer "+cfg.AuthToken)
-		}
+		setForwardedHeaders(req)
 	}
 
-	// IMPORTANTE: Aplicar middleware de seguridad ANTES del proxy
-	// Esto valida que la request venga del frontend, no directamente del navegador
-	return frontendValidationMiddleware(cfg, proxy)
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		log.Printf("[PROXY ERROR] %s %s: %v", r.Method, r.URL.Path, err)
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+	}
+
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		// No alterar cabeceras de respuesta del backend (CORS, Set-Cookie, etc.)
+		return nil
+	}
+
+	return proxy
 }
 
-func restrictToCloudflare(next http.Handler) http.Handler {
-	cloudflareCIDRs := []string{
-		// Cloudflare IPv4 (puedes agregar más)
-		"173.245.48.0/20",
-		"103.21.244.0/22",
-		"103.22.200.0/22",
-		"103.31.4.0/22",
-		"141.101.64.0/18",
-		"108.162.192.0/18",
-		"190.93.240.0/20",
-		"188.114.96.0/20",
-		"197.234.240.0/22",
-		"198.41.128.0/17",
-		"162.158.0.0/15",
-		"104.16.0.0/13",
-		"104.24.0.0/14",
-		"172.64.0.0/13",
-		"131.0.72.0/22",
+// setForwardedHeaders añade X-Forwarded-* sin tocar Authorization ni el resto de cabeceras del cliente.
+func setForwardedHeaders(req *http.Request) {
+	// Peer directo de esta conexión (edge de Cloudflare en producción).
+	peerIP := remoteAddrIP(req)
+	// IP real del usuario final, resuelta a partir de las cabeceras de proxy
+	// (CF-Connecting-IP / X-Real-IP / X-Forwarded-For). En producción, al estar
+	// REQUIRE_CLOUDFLARE=true, estas cabeceras solo llegan desde el edge de CF.
+	clientIP := getClientIP(req, true)
 
-		// Cloudflare IPv6 (opcional)
-		"2400:cb00::/32",
-		"2606:4700::/32",
-		"2803:f800::/32",
-		"2405:b500::/32",
-		"2405:8100::/32",
-		"2a06:98c0::/29",
-		"2c0f:f248::/32",
-	}
-
-	var cloudflareNets []*net.IPNet
-	for _, cidr := range cloudflareCIDRs {
-		_, network, err := net.ParseCIDR(cidr)
-		if err == nil {
-			cloudflareNets = append(cloudflareNets, network)
+	if peerIP != "" {
+		// X-Forwarded-For es una cadena de auditoría: cada proxy añade la IP de
+		// su peer directo. Cloudflare ya colocó la IP del usuario al inicio;
+		// goserve añade la IP del edge de CF que tiene enfrente.
+		if prior := req.Header.Get("X-Forwarded-For"); prior != "" {
+			req.Header.Set("X-Forwarded-For", prior+", "+peerIP)
+		} else {
+			req.Header.Set("X-Forwarded-For", peerIP)
 		}
 	}
+	if clientIP != "" {
+		// X-Real-IP identifica al usuario final, no al proxy intermedio.
+		req.Header.Set("X-Real-IP", clientIP)
+	}
 
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Extraer IP del RemoteAddr
-		host, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
-			http.Error(w, "403 Forbidden", http.StatusForbidden)
-			return
-		}
-		ip := net.ParseIP(host)
-		if ip == nil {
-			http.Error(w, "403 Forbidden", http.StatusForbidden)
-			return
-		}
+	proto := "http"
+	if req.TLS != nil {
+		proto = "https"
+	}
+	if existing := req.Header.Get("X-Forwarded-Proto"); existing != "" {
+		proto = existing
+	}
+	req.Header.Set("X-Forwarded-Proto", proto)
 
-		// Verificar si IP está en la lista de Cloudflare
-		allowed := false
-		for _, net := range cloudflareNets {
-			if net.Contains(ip) {
-				allowed = true
-				break
-			}
-		}
-
-		if !allowed {
-			log.Printf("[SECURITY] IP no autorizada (no es de Cloudflare): %s", ip)
-			http.Error(w, "403 Forbidden", http.StatusForbidden)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
+	if host := req.Host; host != "" {
+		req.Header.Set("X-Forwarded-Host", host)
+	}
 }
 
-func staticHandler(staticDir string, apiProxy http.Handler) http.HandlerFunc {
-	fs := http.FileServer(http.Dir(staticDir))
+func serveStatic(staticDir, wsPath string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/") {
-			apiProxy.ServeHTTP(w, r)
+			http.NotFound(w, r)
 			return
 		}
-
-		path := filepath.Join(staticDir, r.URL.Path)
-
-		// Si el archivo existe, lo sirve directamente
-		if info, err := os.Stat(path); err == nil && !info.IsDir() {
-			fs.ServeHTTP(w, r)
-			return
-		}
-
-		// Si la ruta tiene extensión (ej. .js), no sirve index.html: responde 404
-		if strings.Contains(filepath.Base(r.URL.Path), ".") {
+		if wsPath != "" && (r.URL.Path == wsPath || strings.HasPrefix(r.URL.Path, wsPath+"/")) {
 			http.NotFound(w, r)
 			return
 		}
 
-		// Rutas tipo /dashboard, /home → sirve index.html
-		http.ServeFile(w, r, filepath.Join(staticDir, "index.html"))
+		fullPath, err := safeStaticPath(staticDir, r.URL.Path)
+		if err != nil {
+			if errors.Is(err, errPathTraversal) {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+
+		info, err := os.Stat(fullPath)
+		if err == nil && !info.IsDir() {
+			ext := filepath.Ext(fullPath)
+			if ext == ".js" || ext == ".css" || ext == ".jpg" || ext == ".png" || ext == ".svg" || ext == ".webp" {
+				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			}
+			http.ServeFile(w, r, fullPath)
+			return
+		}
+
+		base := filepath.Base(r.URL.Path)
+		if strings.Contains(base, ".") {
+			http.NotFound(w, r)
+			return
+		}
+
+		indexPath, err := safeStaticPath(staticDir, "/index.html")
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		http.ServeFile(w, r, indexPath)
 	}
 }
 
-func corsMiddleware(domain string, next http.Handler) http.Handler {
+func safeStaticPath(staticDir, requestPath string) (string, error) {
+	absStatic, err := filepath.Abs(staticDir)
+	if err != nil {
+		return "", err
+	}
+
+	clean := filepath.Clean(requestPath)
+	clean = strings.TrimPrefix(clean, string(filepath.Separator))
+	if clean == "." {
+		clean = ""
+	}
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", errPathTraversal
+	}
+
+	full := filepath.Join(absStatic, clean)
+	absFull, err := filepath.Abs(full)
+	if err != nil {
+		return "", err
+	}
+
+	rel, err := filepath.Rel(absStatic, absFull)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", errPathTraversal
+	}
+
+	return absFull, nil
+}
+
+func rateLimitMiddleware(rl *RateLimiter, trustForwarded bool) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ip := getClientIP(r, trustForwarded)
+			if !rl.GetLimiter(ip).Allow() {
+				http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func cloudflareOnlyMiddleware(cfm *CloudflareIPManager) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			serverIP := remoteAddrIP(r)
+			parsedIP := net.ParseIP(serverIP)
+			if parsedIP == nil || !cfm.IsCloudflareIP(parsedIP) {
+				log.Printf("[CLOUDFLARE] rechazado RemoteAddr=%s", r.RemoteAddr)
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func devCORSMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		referer := r.Header.Get("Referer")
-
-		// Lista de orígenes permitidos
-		allowedOrigins := []string{
-			"https://" + domain,
-			"https://www." + domain,
-			"http://localhost:8080", // Para desarrollo
-			"http://127.0.0.1:3000",
-			"http://127.0.0.1:8080",
-		}
-
-		// Verificar si el origin está permitido
-		originAllowed := false
 		if origin != "" {
-			for _, allowed := range allowedOrigins {
-				if origin == allowed {
-					originAllowed = true
-					break
-				}
-			}
-		}
-
-		// Para requests sin origin (como algunos mobile apps), verificar referer
-		if !originAllowed && origin == "" {
-			for _, allowed := range allowedOrigins {
-				if strings.HasPrefix(referer, allowed) {
-					originAllowed = true
-					origin = allowed // Asignar para el header de respuesta
-					break
-				}
-			}
-		}
-
-		// Solo para rutas API, ser más estricto
-		if strings.HasPrefix(r.URL.Path, "/api/") {
-			// Para API, requerir origin válido
-			if !originAllowed {
-				log.Printf("[CORS] Origin no permitido para API: %s (referer: %s)", origin, referer)
-				http.Error(w, "403 Forbidden - Invalid Origin", http.StatusForbidden)
-				return
-			}
-
-			// Verificar User-Agent para APIs (opcional - bloquear curl, wget, etc)
-			userAgent := r.Header.Get("User-Agent")
-			if isBlockedUserAgent(userAgent) {
-				log.Printf("[CORS] User-Agent bloqueado: %s", userAgent)
-				http.Error(w, "403 Forbidden - Invalid User-Agent", http.StatusForbidden)
-				return
-			}
-		}
-
-		// Establecer headers CORS solo si el origin está permitido
-		if originAllowed {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Origin, X-Requested-With")
+			w.Header().Set("Access-Control-Max-Age", "86400")
 		}
-
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Internal-Auth")
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
-		w.Header().Set("Access-Control-Max-Age", "86400") // Cache preflight por 24h
-
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-
 		next.ServeHTTP(w, r)
 	})
 }
 
-// Función auxiliar para bloquear ciertos User-Agents
-func isBlockedUserAgent(userAgent string) bool {
-	blockedAgents := []string{
-		"curl",
-		"wget",
-		"python-requests",
-		"Postman",
-		"Insomnia",
-		"HTTPie",
-		"Go-http-client",
-		"okhttp",
-	}
-
-	userAgentLower := strings.ToLower(userAgent)
-	for _, blocked := range blockedAgents {
-		if strings.Contains(userAgentLower, strings.ToLower(blocked)) {
-			return true
-		}
-	}
-
-	return false
-}
-
-/* // Cache simple para rate limiting (en producción usa Redis)
-var rateLimitCache = make(map[string][]time.Time)
-
-func isRateLimited(ip string) bool {
-	now := time.Now()
-	windowDuration := 1 * time.Minute
-	maxRequests := 60 // 60 requests por minuto
-
-	// Limpiar requests antiguos
-	requests := rateLimitCache[ip]
-	validRequests := make([]time.Time, 0)
-
-	for _, reqTime := range requests {
-		if now.Sub(reqTime) < windowDuration {
-			validRequests = append(validRequests, reqTime)
-		}
-	}
-
-	// Agregar request actual
-	validRequests = append(validRequests, now)
-	rateLimitCache[ip] = validRequests
-
-	return len(validRequests) > maxRequests
-} */
-
-func isValidBrowserUserAgent(userAgent string) bool {
-	// User-agents válidos de navegadores principales
-	validBrowsers := []string{
-		"Mozilla/5.0", // Chrome, Firefox, Safari, Edge
-		"WebKit",      // Safari, Chrome
-		"Gecko",       // Firefox
-		"Chrome",      // Chrome, Edge
-		"Safari",      // Safari
-		"Edge",        // Edge
-	}
-
-	for _, browser := range validBrowsers {
-		if strings.Contains(userAgent, browser) {
-			return true
-		}
-	}
-
-	return false
-}
-
-func securityHeadersMiddleware(next http.Handler) http.Handler {
+func productionSecurityHeadersMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Seguridad general del navegador
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		// Solo para assets estáticos servidos por este proceso; /api/ lo resuelve el backend.
+		if !strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+			w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
-		// Forzar HTTPS en el navegador (HSTS)
-		w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
-
-		// Protección básica de contenido (opcional, según tu app)
-		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
-		w.Header().Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
-
+func productionCORSMiddleware(next http.Handler) http.Handler {
+	allowedOrigins := map[string]bool{
+		"https://pigzhub.com":       true,
+		"https://www.pigzhub.com":   true,
+		"https://admin.pigzhub.com": true,
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" && allowedOrigins[origin] {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Origin, X-Requested-With")
+			w.Header().Set("Access-Control-Max-Age", "86400")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -412,11 +565,11 @@ func gzipMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-
 		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Vary", "Accept-Encoding")
 		gz := gzip.NewWriter(w)
 		defer gz.Close()
-		gzw := gzipResponseWriter{Writer: gz, ResponseWriter: w}
+		gzw := &gzipResponseWriter{Writer: gz, ResponseWriter: w}
 		next.ServeHTTP(gzw, r)
 	})
 }
@@ -426,111 +579,142 @@ type gzipResponseWriter struct {
 	http.ResponseWriter
 }
 
-func (w gzipResponseWriter) Write(b []byte) (int, error) {
+func (w *gzipResponseWriter) Write(b []byte) (int, error) {
 	return w.Writer.Write(b)
+}
+
+func (w *gzipResponseWriter) WriteHeader(statusCode int) {
+	w.Header().Del("Content-Length")
+	w.ResponseWriter.WriteHeader(statusCode)
 }
 
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		next.ServeHTTP(w, r)
-		log.Printf("[%s] %s %s", r.Method, r.URL.Path, time.Since(start))
+		lrw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		next.ServeHTTP(lrw, r)
+		log.Printf("[%s] %s %d %v %s",
+			r.Method, r.URL.Path, lrw.statusCode, time.Since(start), getClientIP(r, true))
 	})
 }
 
-// Middleware para validar que las requests vienen del frontend legítimo
-func frontendValidationMiddleware(cfg *config.Config, next http.Handler) http.Handler {
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (lrw *loggingResponseWriter) WriteHeader(code int) {
+	lrw.statusCode = code
+	lrw.ResponseWriter.WriteHeader(code)
+}
+
+func (lrw *loggingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := lrw.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("upstream ResponseWriter does not support Hijack")
+	}
+	return hijacker.Hijack()
+}
+
+func redirectToHTTPS() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		/* // 1. Rate limiting básico por IP
-		if isRateLimited(r.RemoteAddr) {
-			http.Error(w, "429 Too Many Requests", http.StatusTooManyRequests)
-			return
-		} */
-
-		// 2. Verificar que tenga headers de navegador válidos
-		if !hasValidBrowserHeaders(r) {
-			log.Printf("[SECURITY] Request sin headers de navegador válidos desde: %s", r.RemoteAddr)
-			http.Error(w, "403 Forbidden - Invalid Headers", http.StatusForbidden)
-			return
-		}
-
-		// 3. Verificar que venga de JavaScript fetch/XMLHttpRequest
-		if !isValidAjaxRequest(r) {
-			log.Printf("[SECURITY] Request no es AJAX válido desde: %s", r.RemoteAddr)
-			http.Error(w, "403 Forbidden - Direct Access Not Allowed", http.StatusForbidden)
-			return
-		}
-
-		next.ServeHTTP(w, r)
+		target := "https://" + r.Host + r.URL.RequestURI()
+		http.Redirect(w, r, target, http.StatusMovedPermanently)
 	})
 }
 
-// Validar que sea una request AJAX legítima
-func isValidAjaxRequest(r *http.Request) bool {
-	// Debug: imprimir headers para diagnosticar
-	log.Printf("[DEBUG] Method: %s, Accept: %s", r.Method, r.Header.Get("Accept"))
-	log.Printf("[DEBUG] Sec-Fetch-Site: %s, Sec-Fetch-Mode: %s",
-		r.Header.Get("Sec-Fetch-Site"), r.Header.Get("Sec-Fetch-Mode"))
-
-	accept := r.Header.Get("Accept")
-
-	// 1. Para fetch() sin especificar Accept, viene como "*/*"
-	if accept == "" {
-		return false
-	}
-
-	// 2. Verificar headers de seguridad del navegador (si están presentes)
-	secFetchSite := r.Header.Get("Sec-Fetch-Site")
-	secFetchMode := r.Header.Get("Sec-Fetch-Mode")
-
-	if secFetchSite != "" {
-		// Si existe, debe ser same-origin o none (para localhost)
-		if secFetchSite != "same-origin" && secFetchSite != "none" {
-			return false
+func remoteAddrIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		if ip := net.ParseIP(strings.TrimSpace(r.RemoteAddr)); ip != nil {
+			return ip.String()
 		}
+		return ""
 	}
-
-	if secFetchMode != "" {
-		// Si existe, debe ser cors, navigate, o no-cors
-		if secFetchMode != "cors" && secFetchMode != "navigate" && secFetchMode != "no-cors" {
-			return false
-		}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String()
 	}
-
-	// 3. Para POST/PUT/DELETE, verificar Content-Type solo si se envía body
-	if r.Method != "GET" && r.Method != "OPTIONS" && r.Method != "HEAD" {
-		contentType := r.Header.Get("Content-Type")
-		if contentType != "" && !strings.Contains(contentType, "application/json") {
-			return false
-		}
-	}
-
-	return true
+	return host
 }
 
-// Versión mejorada de validación de headers de navegador
-func hasValidBrowserHeaders(r *http.Request) bool {
-	userAgent := r.Header.Get("User-Agent")
-	accept := r.Header.Get("Accept")
-
-	// Debug: imprimir headers importantes
-	log.Printf("[DEBUG] User-Agent: %s", userAgent)
-	log.Printf("[DEBUG] Accept: %s", accept)
-
-	// Debe tener User-Agent de navegador
-	if userAgent == "" || !isValidBrowserUserAgent(userAgent) {
-		return false
+func getClientIP(r *http.Request, trustForwarded bool) string {
+	if !trustForwarded {
+		return remoteAddrIP(r)
 	}
 
-	// Debe tener header Accept
-	if accept == "" {
-		return false
+	parse := func(raw string) string {
+		raw = strings.TrimSpace(raw)
+		if ip := net.ParseIP(raw); ip != nil {
+			return ip.String()
+		}
+		return ""
 	}
 
-	// Accept puede ser "*/*" (fetch por defecto) o incluir application/json
-	validAccept := strings.Contains(accept, "*/*") || 
-				  strings.Contains(accept, "application/json") ||
-				  strings.Contains(accept, "text/html")
+	if ip := parse(r.Header.Get("CF-Connecting-IP")); ip != "" {
+		return ip
+	}
+	if ip := parse(r.Header.Get("X-Real-IP")); ip != "" {
+		return ip
+	}
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		for _, part := range strings.Split(xff, ",") {
+			if ip := parse(part); ip != "" {
+				return ip
+			}
+		}
+	}
+	return remoteAddrIP(r)
+}
 
-	return validAccept
+func isPrivateIP(hostname string) bool {
+	if hostname == "localhost" {
+		return true
+	}
+
+	ip := net.ParseIP(hostname)
+	if ip == nil {
+		ips, err := net.LookupIP(hostname)
+		if err != nil || len(ips) == 0 {
+			return false
+		}
+		ip = ips[0]
+	}
+
+	for _, cidr := range []string{
+		"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+		"127.0.0.0/8", "::1/128", "fc00::/7",
+	} {
+		_, network, err := net.ParseCIDR(cidr)
+		if err == nil && network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func validateConfig(cfg *config.Config, mode string) error {
+	if cfg.BackendURL == "" {
+		return fmt.Errorf("backend_url es obligatorio")
+	}
+
+	if mode != "dev" {
+		if cfg.Domain == "" {
+			return fmt.Errorf("domain es obligatorio en producción")
+		}
+		if cfg.RateLimit <= 0 {
+			cfg.RateLimit = 50
+		}
+		if cfg.RateBurst <= 0 {
+			cfg.RateBurst = 100
+		}
+		if cfg.AdminEmail == "" && (cfg.TLSCertFile == "" || cfg.TLSKeyFile == "") {
+			log.Println("⚠️  ADMIN_EMAIL no configurado (recomendado para Let's Encrypt)")
+		}
+	}
+
+	if _, err := url.Parse(cfg.BackendURL); err != nil {
+		return fmt.Errorf("backend_url inválida: %w", err)
+	}
+
+	return nil
 }

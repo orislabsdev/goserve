@@ -1,5 +1,5 @@
 # Variables
-BINARY_NAME = go-server
+BINARY_NAME = goserve
 SRC = main.go
 BUILD_DIR = build
 GOOS ?= linux
