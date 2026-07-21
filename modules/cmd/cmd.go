@@ -5,8 +5,8 @@ import (
 	"log"
 	"strings"
 
-	"github.com/polarysfoundation/go-server/modules/config"
-	"github.com/polarysfoundation/go-server/modules/server"
+	"github.com/orislabsdev/goserve/modules/config"
+	"github.com/orislabsdev/goserve/modules/server"
 )
 
 func Run() {

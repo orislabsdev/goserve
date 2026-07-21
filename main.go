@@ -1,6 +1,6 @@
 package main
 
-import "github.com/polarysfoundation/go-server/modules/cmd"
+import "github.com/orislabsdev/goserve/modules/cmd"
 
 func main() {
 	cmd.Run()

@@ -1,4 +1,4 @@
-module github.com/polarysfoundation/go-server
+module github.com/orislabsdev/goserve
 
 go 1.24.4
 

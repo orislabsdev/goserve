@@ -21,7 +21,7 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/time/rate"
 
-	"github.com/polarysfoundation/go-server/modules/config"
+	"github.com/orislabsdev/goserve/modules/config"
 )
 
 var errPathTraversal = errors.New("path traversal")
