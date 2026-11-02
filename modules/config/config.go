@@ -10,10 +10,11 @@ import (
 )
 
 type Config struct {
-	Host    string `json:"host"`
-	Port    string `json:"port"`
-	TLSPort string `json:"tls_port"`
-	Domain  string `json:"domain"`
+	Host           string   `json:"host"`
+	Port           string   `json:"port"`
+	TLSPort        string   `json:"tls_port"`
+	Domain         string   `json:"domain"`
+	AllowedOrigins []string `json:"allowed_origins"`
 
 	TLSCertFile string `json:"tls_cert_file"`
 	TLSKeyFile  string `json:"tls_key_file"`
