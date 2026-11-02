@@ -397,41 +397,33 @@ func proxyBackendHandler(cfg *config.Config, cf *CloudflareIPManager) http.Handl
 		log.Println("⚠️  Backend appears to be on a public network; make sure it is not directly reachable")
 	}
 
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.Transport = &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
+	// CHANGED: build ReverseProxy directly instead of via
+	// NewSingleHostReverseProxy. The latter sets BOTH Director and Rewrite
+	// (Go ≥ 1.20), and ReverseProxy requires exactly one. Building it
+	// manually avoids that pitfall and makes the behavior explicit.
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(target)
+			setForwardedHeaders(pr, cfg.RequireCloudflare, cf)
+		},
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("[PROXY ERROR] %s %s: %v", r.Method, r.URL.Path, err)
+			http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		},
 	}
 
-	// CRITICAL FIX: NewSingleHostReverseProxy installs a default Rewrite that
-	// calls SetURL + SetXForwarded. SetXForwarded OVERWRITES the
-	// X-Forwarded-For sent by Cloudflare with the direct peer IP.
-	// Additionally, the previous code wrote to pr.In (already cloned into
-	// pr.Out before Rewrite is called), so custom headers did NOT reach
-	// the backend.
-	//
-	// Solution: replace Rewrite entirely. SetURL sets scheme/host/path and
-	// then we rebuild the X-Forwarded-* headers on pr.Out while honoring the
-	// original XFF coming from Cloudflare.
-	proxy.Rewrite = func(pr *httputil.ProxyRequest) {
-		pr.SetURL(target)
-		setForwardedHeaders(pr, cfg.RequireCloudflare, cf)
-	}
-
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("[PROXY ERROR] %s %s: %v", r.Method, r.URL.Path, err)
-		http.Error(w, "Bad Gateway", http.StatusBadGateway)
-	}
-
-	// CHANGED: ModifyResponse removed (it was a no-op).
 	return proxy
 }
 
