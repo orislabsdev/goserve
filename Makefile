@@ -10,12 +10,15 @@ VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 COMMIT  := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_TIME := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-# Paquete donde estarán las variables de versión (ajústalo a tu proyecto)
+# Paquete donde estarán las variables de versión
 VERSION_PKG = main
 
 LDFLAGS = -X '$(VERSION_PKG).Version=$(VERSION)' \
           -X '$(VERSION_PKG).Commit=$(COMMIT)' \
           -X '$(VERSION_PKG).BuildTime=$(BUILD_TIME)'
+
+# Nombre final del binario con versión y plataforma
+BINARY_FULL = $(BINARY_NAME)_$(VERSION)-$(GOOS)
 
 # Argumentos por defecto del servidor
 PORT ?= 443
@@ -31,12 +34,12 @@ DOMAIN ?= localhost
 all: build
 
 build:
-	@echo "🔨 Compilando $(BINARY_NAME) $(VERSION) ($(COMMIT)) para $(GOOS)/$(GOARCH)..."
-	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY_NAME) $(SRC)
+	@echo "🔨 Compilando $(BINARY_FULL) para $(GOOS)/$(GOARCH)..."
+	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY_FULL) $(SRC)
 
 run:
-	@echo "🚀 Ejecutando $(BINARY_NAME)..."
-	./$(BUILD_DIR)/$(BINARY_NAME) \
+	@echo "🚀 Ejecutando $(BINARY_FULL)..."
+	./$(BUILD_DIR)/$(BINARY_FULL) \
 		--dir $(STATIC_DIR) \
 		--port $(PORT) \
 		--http-port $(HTTP_PORT) \
@@ -52,11 +55,12 @@ clean:
 version:
 	@echo "Versión:    $(VERSION)"
 	@echo "Commit:     $(COMMIT)"
+	@echo "Binario:    $(BINARY_FULL)"
 	@echo "Build time: $(BUILD_TIME)"
 
 help:
 	@echo "🛠️  Comandos disponibles:"
-	@echo "  make build        -> Compila el binario"
+	@echo "  make build        -> Compila el binario ($(BINARY_FULL))"
 	@echo "  make run          -> Ejecuta con los argumentos por defecto"
 	@echo "  make version      -> Muestra la versión calculada"
 	@echo "  make clean        -> Limpia binarios"
